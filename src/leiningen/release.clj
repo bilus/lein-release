@@ -1,7 +1,8 @@
 (ns leiningen.release
   (:require
-   [clojure.java.shell :as sh]
-   [clojure.string     :as string]
+   [clojure.java.shell     :as sh]
+   [clojure.string         :as string]
+   [leiningen.core.project :as project]
    leiningen.do)
   (:refer leiningen.do :rename {do lein-do})
   (:import
@@ -206,12 +207,7 @@
        (.group m 1))))
 
 (defn update-version-in-project [project release-version]
-  (with-meta
-    (merge project {:version release-version})
-    (-> (meta project)
-        (update-in [:without-profiles :lein-release :version] (constantly release-version))
-        (update-in [:without-profiles :version] (constantly release-version))
-        (update-in [:version] (constantly release-version)))))
+  (project/merge-profiles project [{:version release-version}]))
 
 (defn prepare-from-snapshot [project current-version release-version]
   (println (format "setting project version %s => %s" current-version release-version))
