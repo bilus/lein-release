@@ -8,3 +8,7 @@ target
 /checkouts
 /.lein-deps-sum
 *~
+/.idea/
+/.lein-env
+/.nrepl-port
+/lein_release.iml
