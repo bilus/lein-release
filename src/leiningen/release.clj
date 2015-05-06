@@ -1,7 +1,10 @@
 (ns leiningen.release
   (:require
-   [clojure.java.shell :as sh]
-   [clojure.string     :as string])
+   [clojure.java.shell     :as sh]
+   [clojure.string         :as string]
+   [leiningen.core.project :as project]
+   leiningen.do)
+  (:refer leiningen.do :rename {do lein-do})
   (:import
    [java.util.regex Pattern]))
 
@@ -120,6 +123,12 @@
         new-minor-version (str (inc (Integer/parseInt minor-version)) "-SNAPSHOT")]
     (string/join "." (conj version-parts new-minor-version))))
 
+(defn is-snapshot? [vstring]
+  (.endsWith vstring "-SNAPSHOT"))
+
+(defn compute-release-version [current-version]
+  (str (.replaceAll current-version "-SNAPSHOT" "")
+       (get-release-qualifier)))
 
 
 (defn replace-project-version [old-vstring new-vstring]
@@ -135,38 +144,65 @@
 (defn set-project-version! [old-vstring new-vstring]
   (spit "project.clj" (replace-project-version old-vstring new-vstring)))
 
-(defn detect-deployment-strategy [project]
-  (cond
-    (:deploy-via config)
-    (:deploy-via config)
-
-    (:repositories project)
-    :lein-deploy
-
-    :no-deploy-strategy
-    :lein-install))
-
+(defn detect-deployment-strategy
+  ([project]
+     (or (:deploy-via config)
+         (and (:repositories project) :lein-deploy)
+         :lein-install))
+  ([project & _]
+     (detect-deployment-strategy project)))
 
 (defn clojars-url []
   (or (:clojars-url config)
       default-clojars-url))
 
-(defn perform-deploy! [project project-jar]
-  (case (detect-deployment-strategy project)
+(defmulti deploy! detect-deployment-strategy :default :unrecognized)
 
-    :lein-deploy
-    (sh! "lein" "deploy")
+(defmethod deploy! :lein-deploy [project artifact]
+  (println (format "deploying %s" artifact))
+  (lein-do project "deploy"))
 
-    :lein-install
-    (sh! "lein" "install")
+(defmethod deploy! :lein-install [project artifact]
+  (println (format "installing %s" artifact))
+  (lein-do project "install"))
 
-    :clojars
-    (sh! "scp" "pom.xml" project-jar (clojars-url))
+(defmethod deploy! :clojars [project artifact]
+  (println (format "deploying %s to clojars at %s" artifact (clojars-url)))
+  (sh! "scp" "pom.xml" artifact (clojars-url)))
 
-    :shell
-    (apply sh! (:shell config))
+(defmethod deploy! :shell [project artifact]
+  (println (format "executing shell command %s" (:shell config)))
+  (apply sh! (:shell config)))
 
-    (raise "Error: unrecognized deploy strategy: %s" (detect-deployment-strategy))))
+(defmethod deploy! :unrecognized [project artifact]
+  (raise "Error: unrecognized deploy strategy: %s" (detect-deployment-strategy project)))
+
+
+(defn detect-build-strategy
+  ([]
+     (or (:build-via config) :lein-jar-pom))
+  ([& _]
+     (detect-build-strategy)))
+
+(defmulti build! detect-build-strategy :default :unrecognized)
+
+(defmethod build! :lein-jar-pom [project target-dir & args]
+  (let [artifact (format "%s/%s-%s.jar" target-dir (:name project) (:version project))]
+    (when-not (-> artifact java.io.File. .exists)
+      (println "creating jar and pom files...")
+      (lein-do project "jar," "pom"))
+    artifact))
+
+(defmethod build! :lein-uberjar [project target-dir & args]
+  (let [artifact (format "%s/%s-%s.jar" target-dir (:name project) (:version project))]
+    (println artifact)
+    (when-not (-> artifact java.io.File. .exists)
+      (println "creating jar and pom files...")
+      (sh! "lein" "do" "clean," "uberjar"))
+    artifact))
+
+(defmethod build! :unrecognized [project target-dir & args]
+  (raise "Error: unrecognized build strategy: %s" (detect-build-strategy project)))
 
 (defn extract-project-version-from-file
   ([]
@@ -178,12 +214,25 @@
          (raise "Error: unable to find project version in file: %s" proj-file))
        (.group m 1))))
 
-(defn is-snapshot? [vstring]
-  (.endsWith vstring "-SNAPSHOT"))
+(defn update-version-in-project [project release-version]
+  (project/merge-profiles project [{:version release-version}]))
 
-(defn compute-release-version [current-version]
-  (str (.replaceAll current-version "-SNAPSHOT" "")
-       (get-release-qualifier)))
+(defn prepare-from-snapshot [project current-version release-version]
+  (println (format "setting project version %s => %s" current-version release-version))
+  (set-project-version! current-version release-version)
+  (println "adding, committing and tagging project.clj")
+  (scm! :add "project.clj")
+  (scm! :commit "-m" (format "lein-release plugin: preparing %s release" release-version))
+  (scm! :tag (format "%s-%s" (:name project) release-version)))
+
+
+(defn update-to-snapshot [current-version release-version]
+  (let [next-dev-version (compute-next-development-version (.replaceAll current-version "-SNAPSHOT" ""))]
+    (println (format "updating version %s => %s for next dev cycle" release-version next-dev-version))
+    (set-project-version! release-version next-dev-version)
+    (scm! :add "project.clj")
+    (scm! :commit "-m" (format "lein-release plugin: bumped version from %s to %s for next development cycle" release-version next-dev-version))))
+
 
 (comment
 
@@ -192,28 +241,18 @@
 
 )
 
+
 (defn release [project & args]
   (binding [config (or (:lein-release project) config)]
     (let [current-version  (get project :version)
           release-version  (compute-release-version current-version)
-          next-dev-version (compute-next-development-version (.replaceAll current-version "-SNAPSHOT" ""))
+          release-project  (update-version-in-project project release-version)
           target-dir       (:target-path project (:target-dir project (:jar-dir project "."))) ; target-path for lein2, target-dir or jar-dir for lein1
-          jar-file-name    (format "%s/%s-%s.jar" target-dir (:name project) release-version)]
+          ]
       (when (is-snapshot? current-version)
-        (println (format "setting project version %s => %s" current-version release-version))
-        (set-project-version! current-version release-version)
-        (println "adding, committing and tagging project.clj")
-        (scm! :add "project.clj")
-        (scm! :commit "-m" (format "lein-release plugin: preparing %s release" release-version))
-        (scm! :tag (format "%s-%s" (:name project) release-version)))
-      (when-not (.exists (java.io.File. jar-file-name))
-        (println "creating jar and pom files...")
-        (sh! "lein" "jar")
-        (sh! "lein" "pom"))
-      (perform-deploy! project jar-file-name)
+        (prepare-from-snapshot project current-version release-version))
+      (->> (build! release-project target-dir)
+           (deploy! release-project))
       (when-not (is-snapshot? (extract-project-version-from-file))
-        (println (format "updating version %s => %s for next dev cycle" release-version next-dev-version))
-        (set-project-version! release-version next-dev-version)
-        (scm! :add "project.clj")
-        (scm! :commit "-m" (format "lein-release plugin: bumped version from %s to %s for next development cycle" release-version next-dev-version))))))
+        (update-to-snapshot current-version release-version)))))
 
