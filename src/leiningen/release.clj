@@ -26,7 +26,9 @@
   (or
    (:scm config)
    (cond
-     (.exists (java.io.File. ".git"))
+     (or (.exists (java.io.File. ".git"))
+         (.startsWith (:out (sh/sh "git" "rev-parse" "--is-inside-work-tree"))
+                      "true"))
      :git
      :no-scm-detected
      (raise "Error: no scm detected! (I know only about git for now)."))))
